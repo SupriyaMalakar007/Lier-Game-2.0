@@ -13,6 +13,8 @@ from pathlib import Path
 
 from aiohttp import web, WSMsgType
 
+rng = random.SystemRandom()  # OS entropy: unpredictable, no seed bias
+
 RANKS = ["Ace", "King", "Queen"]
 BOT_NAMES = ["Rook", "Vesper", "Mox", "Juno", "Sable", "Pike"]
 TURN_SECONDS = 45
@@ -27,12 +29,12 @@ async def nap(seconds):
 
 def new_deck():
     deck = ["King"] * 6 + ["Queen"] * 6 + ["Ace"] * 6 + ["Joker"] * 2 + ["DEVIL"]
-    random.shuffle(deck)
+    rng.shuffle(deck)
     return deck
 
 
 def rid(n, alphabet=string.ascii_lowercase + string.digits):
-    return "".join(random.choices(alphabet, k=n))
+    return "".join(rng.choices(alphabet, k=n))
 
 
 class Player:
@@ -45,7 +47,7 @@ class Player:
 
     def reset(self):
         self.hand, self.alive, self.shots, self.strikes = [], True, 0, 0
-        self.bullet = random.randint(1, 6)  # fixed chamber, never reset between rounds
+        self.bullet = rng.randint(1, 6)  # fixed chamber, never reset between rounds
 
     @property
     def connected(self):
@@ -121,7 +123,13 @@ class Room:
     def start(self):
         for p in self.players:
             p.reset()
+        # each player gets a different random bullet slot (1-6), fresh every game
+        for p, b in zip(self.players, rng.sample(range(1, 7), len(self.players))):
+            p.bullet = b
+        if self.task and not self.task.done():
+            self.task.cancel()
         self.phase, self.round, self.latest, self.winner = "playing", 0, None, None
+        self.cur, self.deadline, self.busy = None, None, False
         self.task = asyncio.create_task(self.run())
 
     async def run(self):
@@ -159,7 +167,7 @@ class Room:
         for p in alive:
             p.hand = [deck.pop() for _ in range(5)]
         self.round += 1
-        self.rank = random.choice(RANKS)
+        self.rank = rng.choice(RANKS)
         self.latest = None
         if starter is None or not starter.alive:
             starter = self.nxt(starter.id if starter else None, alive) or alive[0]
@@ -176,7 +184,7 @@ class Room:
         if p.bot:
             self.deadline = None
             await self.push()
-            await nap(random.uniform(1.5, 2.6))
+            await nap(rng.uniform(1.5, 2.6))
             if p.alive and self.phase == "playing":
                 await self.bot_act(p)
             return
@@ -197,6 +205,9 @@ class Room:
             if kind == "play":
                 if await self.play(p, act.get("idx", [])):
                     return
+                if p.ws is not None:
+                    await send(p.ws, {"t": "err", "msg": "Invalid play. Pick 1 to 3 cards."})
+                await self.push()
             elif kind == "liar":
                 if self.latest and self.latest["by"] != p.id:
                     p.strikes = 0
@@ -234,19 +245,21 @@ class Room:
         p.strikes = 0
         self.latest = {"by": p.id, "cards": cards, "claim": self.rank}
         self.deadline = None
+        others = [q for q in self.alive() if q is not p and q.hand]
+        n = self.nxt(p.id, self.holders())
+        # lock the UI and move the turn marker BEFORE broadcasting, so the player
+        # never sees a stale "your turn" state (that made extra clicks vanish)
+        self.busy = True
+        self.cur = n.id if n else None
         await self.emit(k="play", by=p.id, n=len(cards), claim=self.rank)
         await self.push()
         await nap(0.9)
-        others = [q for q in self.alive() if q is not p and q.hand]
         if not p.hand and len(others) == 1:
-            self.busy = True
             await self.emit(k="toast", msg="Last card played: automatic LIAR!")
             await self.push()
             await nap(1.4)
             await self.resolve(others[0])
             return True
-        n = self.nxt(p.id, self.holders())
-        self.cur = n.id if n else None
         if n is None:
             await self.new_round(self.nxt(p.id, self.alive()))
         return True
@@ -297,23 +310,23 @@ class Room:
         L = self.latest
         if L and L["by"] != p.id:
             n = len(L["cards"])
-            if random.random() < 0.18 + 0.12 * n:
+            if rng.random() < 0.18 + 0.12 * n:
                 await self.emit(k="toast", msg=f"{p.name} calls LIAR!")
                 await self.resolve(p)
                 return
         hand = p.hand
         good = [i for i, c in enumerate(hand) if c in (self.rank, "Joker")]
-        count = random.randint(1, min(3, len(hand)))
-        if good and count > len(good) and random.random() < 0.7:
+        count = rng.randint(1, min(3, len(hand)))
+        if good and count > len(good) and rng.random() < 0.7:
             count = len(good)
-        if good and random.random() >= 0.2:  # usually honest, sometimes bluff
-            pick = random.sample(good, min(count, len(good)))
+        if good and rng.random() >= 0.2:  # usually honest, sometimes bluff
+            pick = rng.sample(good, min(count, len(good)))
             rest = [i for i in range(len(hand)) if i not in pick]
-            random.shuffle(rest)
+            rng.shuffle(rest)
             while len(pick) < count and rest:
                 pick.append(rest.pop())
         else:
-            pick = random.sample(range(len(hand)), count)
+            pick = rng.sample(range(len(hand)), count)
         await self.play(p, pick)
 
     # ---- membership ----------------------------------------------------
@@ -385,7 +398,10 @@ async def ws_handler(request):
                 if not p:
                     await err("Session expired.", fatal=True)
                     continue
-                room, me, p.ws = r, p, ws
+                old, p.ws = p.ws, ws
+                room, me = r, p
+                if old is not None and old is not ws and not old.closed:
+                    await old.close()
             elif room and me:
                 is_host = room.host == me.id
                 if t == "addbot" and is_host and room.phase == "lobby" and len(room.players) < 4:
@@ -403,11 +419,14 @@ async def ws_handler(request):
                     room.start()
                 elif t in ("play", "liar") and room.phase == "playing":
                     room.q.put_nowait((me.id, d))
-                elif t == "again" and is_host and room.phase == "over":
+                elif t == "again" and room.phase == "over":
                     room.players = [p for p in room.players if p.connected]
+                    if room.host not in [p.id for p in room.players if not p.bot]:
+                        room.host = me.id
                     for p in room.players:
                         p.reset()
                     room.phase, room.round, room.latest, room.winner = "lobby", 0, None, None
+                    room.cur, room.deadline, room.busy = None, None, False
                 elif t == "leave":
                     r, p = room, me
                     room, me = None, None
@@ -423,7 +442,7 @@ async def ws_handler(request):
                 await send(ws, {"t": "hello", "id": me.id, "token": me.token, "code": room.code})
             await room.push()
     finally:
-        if room and me:
+        if room and me and me.ws is ws:
             me.ws = None
             if room.phase == "lobby":
                 await room.leave(me)
